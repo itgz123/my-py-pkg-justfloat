@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "justfloat"
+dynamic = ["version"]
+description = "VOFA+ JustFloat 协议 TCP 服务端（固定 10Hz 批量发送）"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "TRW", email = "itgz2085@outlook.com" }]
+keywords = ["vofa", "justfloat", "tcp", "telemetry", "oscilloscope", "simulation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/itgz123/my-py-pkg-justfloat"
+Repository = "https://github.com/itgz123/my-py-pkg-justfloat.git"
+
+[tool.setuptools.packages.find]
+include = ["justfloat*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "justfloat.__version__" }
