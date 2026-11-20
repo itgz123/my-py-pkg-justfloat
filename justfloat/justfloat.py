@@ -51,6 +51,10 @@ class JustFloatServer:
     快照预打包 (struct.pack) 推入 FIFO 缓冲区。发送线程每 0.1s
     清空缓冲区，b"".join 拼接成一个大包，一次 sendall() 发出。
 
+    未连接客户端时 ``send()`` 仍会入队（满时丢最旧帧），发送线程
+    只等待连接；连上后积压帧会一次性发出。需要避免积压时，先判断
+    :attr:`is_connected` 再调用 ``send()``。
+
     用法::
 
         server = JustFloatServer(channels=6)   # 6 通道
@@ -156,6 +160,16 @@ class JustFloatServer:
 
         # 直接打包入队: 跳过中间 list 分配, 发线程不再 pack
         self._send_queue.append(struct.pack(self._pack_fmt, *self._buffer) + self.TAIL)
+
+    @property
+    def is_connected(self) -> bool:
+        """当前是否有 VOFA+ 客户端连接。
+
+        发送线程在 accept 成功后置为 True，在 sendall 失败或 close()
+        后置为 False。客户端主动断开时，通常要等到下一次发送失败才会
+        反映为 False（本服务端不读取客户端数据，无法立即感知 FIN）。
+        """
+        return self._client is not None
 
     def set_buffer_size(self, size: int) -> None:
         """设置发送缓冲区容量 (帧数)。

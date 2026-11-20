@@ -11,6 +11,7 @@ VOFA+ 上位机看波形。纯标准库实现，无第三方运行时依赖。
 | 固定 10Hz 发送 | 发送线程每 0.1s 把队列里所有帧 `b"".join` 后一次 `sendall()` |
 | 有界 FIFO 缓冲 | `deque(maxlen=256)`，满了丢最旧帧保实时性，可 `set_buffer_size()` 调整 |
 | 单客户端 | 接受一个客户端，断开后自动等待重连 |
+| 连接查询 | `is_connected` 属性，可在发送前判断 VOFA+ 是否已连接 |
 
 ## 安装
 
@@ -30,9 +31,19 @@ with JustFloatServer(channels=6, port=12345) as server:
     while True:
         server.set(0, joint[0])
         server.set(1, joint[1])
-        server.send()          # 快照入队，发送线程每 0.1s 批量发出
+        if server.is_connected:     # 未连接时可直接跳过，避免积压
+            server.send()           # 快照入队，发送线程每 0.1s 批量发出
         p.stepSimulation()
 ```
+
+### TCP 未连接时
+
+- `send()` **不会阻塞、也不会报错**，仍会把帧打包压入有界队列；队列满（默认
+  256 帧）后丢最旧帧。发送线程在无客户端时只做 `accept()` 等待。
+- 客户端连上后，队列中积压的帧会在下一个 10Hz 发送周期一次性发出。
+  如果不希望重连瞬间收到旧数据，发送前先判断 `server.is_connected`。
+- 客户端断开后，服务端通常要等到下一次 `sendall()` 失败才会把
+  `is_connected` 置回 `False`（服务端不读取客户端数据，无法立即感知 FIN）。
 
 ## API
 
@@ -41,6 +52,7 @@ with JustFloatServer(channels=6, port=12345) as server:
 | `JustFloatServer(channels=4, port=12345)` | 创建并启动（构造即监听 + 启动发送线程） |
 | `set(channel, value)` | 写通道值，纳秒级，不阻塞 |
 | `send()` | 当前缓冲区打包入队，微秒级，不阻塞 |
+| `is_connected` | 属性：当前是否有 VOFA+ 客户端连接 |
 | `set_buffer_size(size)` | 运行时调整缓冲帧数（>=1） |
 | `close()` / `with` | 停止并释放资源（幂等） |
 
