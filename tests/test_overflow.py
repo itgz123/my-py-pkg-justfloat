@@ -4,7 +4,7 @@ import warnings
 
 import pytest
 
-from justfloat import ChannelOverflowWarning, FLOAT32_MAX, JustFloatServer
+from vofa_plus import ChannelOverflowWarning, FLOAT32_MAX, JustFloatServer
 
 
 def test_overflow_warns_once_per_channel() -> None:

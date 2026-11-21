@@ -1,10 +1,11 @@
 """
-VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送模式
-====================================================
+VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送 + 命令接收
+========================================================
 
 架构
 ----
-采用"主线程设值 → send() 预打包 → 发送线程固定 10Hz 拼接发送"的三段流水线:
+发送方向（主线程 → VOFA+）采用"主线程设值 → send() 预打包 → 发送线程
+固定 10Hz 拼接发送"的三段流水线:
 
   主线程 (仿真 @240Hz):
     set(0, ch0) → buffer[0] = ch0          ← 纳秒级，仅写内存
@@ -17,6 +18,13 @@ VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送模式
       1. 清空队列, 收集所有预打包 bytes
       2. b"".join 拼接为一个大字节串
       3. 一次 sendall() 发出
+
+接收方向（VOFA+ 控件 → 主线程）由独立接收线程完成:
+
+  VOFA+ Slider 绑定命令 "cmd0:%.5f\\n"
+    → 发出 "cmd0:1.23456\\n"
+    → 接收线程按行解析 cmdN:float
+    → 主线程 get(0) / get_data() 读取最新值
 
   关键优化:
     - 预计算 pack 格式字符串 f"<{channels}f" (避免每帧重新创建)
@@ -33,17 +41,27 @@ JustFloat 帧格式
 ----------------
   [float1] [float2] ... [floatN] [0x00 0x00 0x80 0x7f]
   ├── 小端 4 字节浮点数 ──┤ ├────── 固定帧尾 ──────┤
+
+命令格式 (VOFA+ → 本服务端)
+---------------------------
+  cmd0:1.23456\\n
+  cmd1:-2.50000\\n
+  ...
+
+  每个 cmdN 只保留最新值；非法行会被静默忽略。
 """
 
-import socket
-import struct
-import threading
 import array
 import collections
 import math
+import re
+import select
+import socket
+import struct
+import threading
 import time
 import warnings
-from typing import Optional
+from typing import Dict, Optional, Union
 
 FLOAT32_MAX: float = 3.4028234663852886e38
 """IEEE-754 单精度浮点数最大值（JustFloat 每通道 4 字节 float32）。"""
@@ -54,11 +72,14 @@ class ChannelOverflowWarning(UserWarning):
 
 
 class JustFloatServer:
-    """固定 10Hz 发送的 JustFloat TCP 服务端。
+    """固定 10Hz 发送的 JustFloat TCP 服务端，同时接收 cmdN 命令。
 
     主线程通过 ``set()`` 写入各通道值，通过 ``send()`` 将当前
     快照预打包 (struct.pack) 推入 FIFO 缓冲区。发送线程每 0.1s
     清空缓冲区，b"".join 拼接成一个大包，一次 sendall() 发出。
+
+    VOFA+ 控件（如 Slider）发来的 ``cmdN:value`` 命令由接收线程解析，
+    主线程用 :meth:`get` / :meth:`get_data` 读取最新值。
 
     未连接客户端时 ``send()`` 仍会入队（满时丢最旧帧），发送线程
     只等待连接；连上后积压帧会一次性发出。需要避免积压时，先判断
@@ -73,6 +94,9 @@ class JustFloatServer:
             server.set(1, joint[1])
             server.set(2, joint[2])
             server.send()                      # 预打包入队
+
+            # 读取 VOFA+ 滑块 cmd0 的值（未收到时用 5.5）
+            kp = server.get(0, default=5.5)
             p.stepSimulation()
     """
 
@@ -85,6 +109,15 @@ class JustFloatServer:
     MAX_BUF = 256
     """发送缓冲区容量 (帧数)。满时自动丢弃最旧帧。可通过 set_buffer_size() 修改。"""
 
+    MAX_LINE_BYTES = 4096
+    """单条命令的最大字节数，防止异常客户端让接收缓冲区无限增长。"""
+
+    _CMD_RE = re.compile(
+        r"^cmd(\d+)\s*:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)$",
+        re.IGNORECASE,
+    )
+    """匹配 ``cmd0:1.23456`` 这类命令，允许数字前后的空白。"""
+
     # ================================================================
     # 构造
     # ================================================================
@@ -96,7 +129,8 @@ class JustFloatServer:
 
         Args:
             channels: 通道数量 (每帧浮点数个数), 默认 4
-            port: TCP 监听端口, 默认 12345
+            port: TCP 监听端口, 默认 12345；传 0 由系统分配（可用
+                :attr:`port` 读取实际端口）
 
         Raises:
             OSError: 端口被占用或地址不可用
@@ -124,6 +158,15 @@ class JustFloatServer:
 
         # ---- 客户端连接 ----
         self._client: Optional[socket.socket] = None
+        self._client_lock = threading.Lock()
+
+        # ---- 接收到的 cmdN 最新值 ----
+        # 键为 "cmd0"、"cmd1" ...，值为 float
+        self._cmd_values: Dict[str, float] = {}
+        self._cmd_lock = threading.Lock()
+        self._recv_buffer = bytearray()
+        self._recv_lock = threading.Lock()
+        self._recv_thread: Optional[threading.Thread] = None
 
         # ---- TCP 服务端套接字 ----
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -132,19 +175,22 @@ class JustFloatServer:
         self._socket.listen(1)
         # accept 超时 50ms: 足够让线程响应退出信号, 又不至于阻塞太久
         self._socket.settimeout(0.05)
+        self._port = self._socket.getsockname()[1]
 
         # ---- 启动发送线程 ----
-        self._thread = threading.Thread(target=self._sender_loop, daemon=True)
+        self._thread = threading.Thread(
+            target=self._sender_loop, name="VofaPlusSender", daemon=True
+        )
         self._thread.start()
 
         print(
             f"JustFloatServer started: {channels} channels, "
-            f"buffer={self.MAX_BUF} frames, port={port}, "
+            f"buffer={self.MAX_BUF} frames, port={self._port}, "
             f"send rate={1/self.SEND_INTERVAL:.0f}Hz"
         )
 
     # ================================================================
-    # 公开 API
+    # 发送 API
     # ================================================================
 
     def set(self, channel: int, value: float) -> None:
@@ -191,13 +237,66 @@ class JustFloatServer:
         # 直接打包入队: 跳过中间 list 分配, 发线程不再 pack
         self._send_queue.append(struct.pack(self._pack_fmt, *self._buffer) + self.TAIL)
 
+    # ================================================================
+    # 接收 API (VOFA+ 命令 → Python)
+    # ================================================================
+
+    def get(self, cmd: Union[int, str], default: Optional[float] = None) -> Optional[float]:
+        """获取 ``cmdN`` 的最新值。
+
+        参数既可以是整数 ``0``，也可以是字符串 ``"cmd0"``。
+
+        Args:
+            cmd: 命令编号或名称，如 ``0`` / ``"cmd0"``
+            default: 尚未收到该命令时返回的值，默认 ``None``
+
+        Returns:
+            最新浮点值；未收到过则返回 ``default``
+
+        Raises:
+            ValueError: cmd 为负数或字符串不符合 ``cmdN`` 格式
+        """
+        key = self._cmd_key(cmd)
+        with self._cmd_lock:
+            return self._cmd_values.get(key, default)
+
+    def get_data(self) -> Dict[str, float]:
+        """返回所有已收到命令的最新值快照。
+
+        Returns:
+            ``{"cmd0": 1.23, "cmd1": 4.56}`` 形式的字典；未收到任何命令
+            时返回空字典。返回的是副本，可在主线程安全遍历。
+        """
+        with self._cmd_lock:
+            return dict(self._cmd_values)
+
+    @property
+    def has_data(self) -> bool:
+        """是否已收到过至少一条 ``cmdN`` 命令。"""
+        with self._cmd_lock:
+            return bool(self._cmd_values)
+
+    def clear_data(self) -> None:
+        """清空所有已接收的命令值。幂等，线程安全。"""
+        with self._cmd_lock:
+            self._cmd_values.clear()
+
+    @property
+    def port(self) -> int:
+        """实际监听的 TCP 端口（构造时传 0 时尤其有用）。"""
+        return self._port
+
+    # ================================================================
+    # 状态 / 生命周期
+    # ================================================================
+
     @property
     def is_connected(self) -> bool:
         """当前是否有 VOFA+ 客户端连接。
 
-        发送线程在 accept 成功后置为 True，在 sendall 失败或 close()
-        后置为 False。客户端主动断开时，通常要等到下一次发送失败才会
-        反映为 False（本服务端不读取客户端数据，无法立即感知 FIN）。
+        发送线程在 accept 成功后置为 True；接收线程在 recv 返回 EOF/出错
+        时置为 False（因此客户端主动断开能被较快感知），sendall 失败或
+        close() 也会置为 False。
         """
         return self._client is not None
 
@@ -221,14 +320,27 @@ class JustFloatServer:
 
     def close(self) -> None:
         """停止服务端并释放资源。幂等。"""
+        if self._socket is None and not self._running:
+            return
+
         self._running = False
         self._close_client()
-        if self._socket is not None:
+
+        sock = self._socket
+        self._socket = None
+        if sock is not None:
             try:
-                self._socket.close()
+                sock.close()
             except OSError:
                 pass
-            self._socket = None
+
+        # 等待线程退出。接收线程最多在 select 上等 0.1s，发送线程最多
+        # 睡 SEND_INTERVAL；0.3s 足够，避免 close() 长时间阻塞。
+        current = threading.current_thread()
+        for thread in (self._thread, self._recv_thread):
+            if thread is not None and thread is not current and thread.is_alive():
+                thread.join(timeout=0.3)
+
         print("JustFloatServer closed")
 
     def __enter__(self) -> "JustFloatServer":
@@ -268,17 +380,23 @@ class JustFloatServer:
                     continue
                 try:
                     client, addr = sock.accept()
-                    self._client = client
-                    print(f"Client connected: {addr}")
-                    # 新连接: 跳过本周期, 等下个周期再发
-                    # (让 TCP 连接稳定 + 缓冲区积累数据)
-                    continue
                 except socket.timeout:
                     continue
                 except OSError:
                     if self._running:
                         time.sleep(0.1)
                     continue
+
+                with self._client_lock:
+                    self._client = client
+                self.clear_data()
+                with self._recv_lock:
+                    self._recv_buffer.clear()
+                self._start_receiver(client)
+                print(f"Client connected: {addr}")
+                # 新连接: 跳过本周期, 等下个周期再发
+                # (让 TCP 连接稳定 + 缓冲区积累数据)
+                continue
 
             # ---- 阶段 2: 清空队列, 拼接所有帧 ----
             # b"".join 比 bytes += 快约 7× (避免 O(N²) 复制)
@@ -300,14 +418,137 @@ class JustFloatServer:
             except OSError:
                 self._close_client()
 
-    def _close_client(self) -> None:
-        """关闭客户端连接。幂等。"""
-        if self._client is not None:
+    # ================================================================
+    # 接收线程
+    # ================================================================
+
+    def _start_receiver(self, client: socket.socket) -> None:
+        """为新连接启动接收线程。"""
+        thread = threading.Thread(
+            target=self._receiver_loop,
+            args=(client,),
+            name="VofaPlusReceiver",
+            daemon=True,
+        )
+        self._recv_thread = thread
+        thread.start()
+
+    def _receiver_loop(self, client: socket.socket) -> None:
+        """接收线程: 持续读取客户端数据，按行解析 ``cmdN:value``。
+
+        用 select 轮询而不是给 socket 设超时：同一个 socket 还要给发送
+        线程 sendall 使用，设 timeout 会让 sendall 在慢客户端上抛异常。
+        """
+        while self._running and self._client is client:
             try:
-                self._client.close()
+                readable, _, _ = select.select([client], [], [], 0.1)
+            except (OSError, ValueError):
+                break
+
+            if not readable:
+                continue
+
+            try:
+                data = client.recv(4096)
+            except OSError:
+                break
+
+            if not data:
+                break  # 对端关闭
+
+            if self._client is not client:
+                break  # 已被发送线程换掉/关闭
+
+            self._feed(client, data)
+
+        self._close_client(client)
+
+    def _feed(self, client: socket.socket, data: bytes) -> None:
+        """把收到的字节追加进缓冲区，并按换行拆出完整命令行。
+
+        持锁并再次确认 client 仍是当前连接，避免旧连接的收尾数据在
+        新连接清空缓冲区之后又写进来。
+        """
+        with self._recv_lock:
+            if self._client is not client:
+                return
+
+            self._recv_buffer.extend(data)
+
+            while True:
+                idx = self._recv_buffer.find(b"\n")
+                if idx < 0:
+                    # 没有换行：半包，等下一次 recv；异常超长行直接丢弃
+                    if len(self._recv_buffer) > self.MAX_LINE_BYTES:
+                        self._recv_buffer.clear()
+                    return
+
+                line = bytes(self._recv_buffer[:idx])
+                del self._recv_buffer[: idx + 1]
+
+                if len(line) > self.MAX_LINE_BYTES:
+                    continue
+                self._parse_line(line)
+
+    def _parse_line(self, line: bytes) -> None:
+        """解析单行命令，非法内容静默忽略。"""
+        try:
+            text = line.strip().decode("ascii")
+        except UnicodeDecodeError:
+            return
+
+        match = self._CMD_RE.match(text)
+        if match is None:
+            return
+
+        try:
+            value = float(match.group(2))
+        except ValueError:
+            return
+
+        if not math.isfinite(value):
+            return
+
+        key = "cmd" + match.group(1)
+        with self._cmd_lock:
+            self._cmd_values[key] = value
+
+    @staticmethod
+    def _cmd_key(cmd: Union[int, str]) -> str:
+        """把 0 / 'cmd0' 统一成 'cmd0'。"""
+        if isinstance(cmd, str):
+            key = cmd.strip().lower()
+            if not re.fullmatch(r"cmd\d+", key):
+                raise ValueError(f"cmd 名称必须是 cmdN 格式，收到 {cmd!r}")
+            return key
+        if not isinstance(cmd, int):
+            raise TypeError(f"cmd 必须是 int 或 str，收到 {type(cmd).__name__}")
+        if cmd < 0:
+            raise ValueError("cmd 编号必须 >= 0")
+        return f"cmd{cmd}"
+
+    # ================================================================
+    # 客户端连接管理
+    # ================================================================
+
+    def _close_client(self, client: Optional[socket.socket] = None) -> None:
+        """关闭客户端连接。幂等。
+
+        Args:
+            client: 只关闭这个客户端；如果它已经不是当前客户端则忽略。
+                接收线程用它在退出时关闭自己对应的连接，避免误关新连接。
+        """
+        with self._client_lock:
+            if client is not None and self._client is not client:
+                return
+            current = self._client
+            self._client = None
+
+        if current is not None:
+            try:
+                current.close()
             except OSError:
                 pass
-            self._client = None
             print("Client disconnected")
 
 
@@ -315,8 +556,6 @@ class JustFloatServer:
 # 使用示例
 # ================================================================
 if __name__ == "__main__":
-    import math
-
     CHANNELS = 4
 
     with JustFloatServer(channels=CHANNELS, port=12345) as server:
@@ -330,6 +569,9 @@ if __name__ == "__main__":
                 server.set(3, math.sin(4 * t))
                 # 推入发送队列
                 server.send()
+
+                # 打印 VOFA+ 滑块发来的 cmd0（未收到时为 None）
+                # print("cmd0 =", server.get(0))
 
                 t += 0.001
                 time.sleep(0.001)
