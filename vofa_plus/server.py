@@ -5,7 +5,7 @@ VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送 + 命令接收
 架构
 ----
 发送方向（主线程 → VOFA+）采用"主线程设值 → send() 预打包 → 发送线程
-固定 10Hz 拼接发送"的三段流水线:
+固定频率拼接发送"的三段流水线:
 
   主线程 (仿真 @240Hz):
     set(0, ch0) → buffer[0] = ch0          ← 纳秒级，仅写内存
@@ -13,8 +13,8 @@ VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送 + 命令接收
     ...
     send() → pack(buffer) → 入队(bytes)    ← 微秒级，已预打包
 
-  发送线程 (固定 10Hz):
-    每 0.1s 唤醒:
+  发送线程 (默认 10Hz):
+    每个 TCP 周期唤醒:
       1. 清空队列, 收集所有预打包 bytes
       2. b"".join 拼接为一个大字节串
       3. 一次 sendall() 发出
@@ -32,9 +32,10 @@ VOFA+ JustFloat 协议 TCP 服务端 — 固定频率发送 + 命令接收
     - 发送线程用 b"".join 替代 bytes += (避免 O(N²) 复制, ~7× 快)
 
 缓冲区:
-  collections.deque(maxlen=MAX_BUF)
+  collections.deque(maxlen=自动估算的帧数)
   - 满时自动丢弃最旧帧 (保持实时性)
   - 空时发送线程跳过 (不发空帧)
+  - 可根据 send_rate_hz / tcp_rate_hz / channels 自动估算
   - 可通过 set_buffer_size() 动态调整
 
 JustFloat 帧格式
@@ -61,7 +62,7 @@ import struct
 import threading
 import time
 import warnings
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, overload
 
 FLOAT32_MAX: float = 3.4028234663852886e38
 """IEEE-754 单精度浮点数最大值（JustFloat 每通道 4 字节 float32）。"""
@@ -72,10 +73,10 @@ class ChannelOverflowWarning(UserWarning):
 
 
 class JustFloatServer:
-    """固定 10Hz 发送的 JustFloat TCP 服务端，同时接收 cmdN 命令。
+    """默认 10Hz 发送的 JustFloat TCP 服务端，同时接收 cmdN 命令。
 
     主线程通过 ``set()`` 写入各通道值，通过 ``send()`` 将当前
-    快照预打包 (struct.pack) 推入 FIFO 缓冲区。发送线程每 0.1s
+    快照预打包 (struct.pack) 推入 FIFO 缓冲区。发送线程每个 TCP 周期
     清空缓冲区，b"".join 拼接成一个大包，一次 sendall() 发出。
 
     VOFA+ 控件（如 Slider）发来的 ``cmdN:value`` 命令由接收线程解析，
@@ -104,10 +105,22 @@ class JustFloatServer:
     """JustFloat 协议帧尾: 0x00 0x00 0x80 0x7f (小端 +Inf)"""
 
     SEND_INTERVAL = 0.1
-    """发送周期 (秒)。固定 10Hz，不可变。"""
+    """默认 TCP 发送周期 (秒)。10Hz，可被构造参数 ``tcp_rate_hz`` 覆盖。"""
 
     MAX_BUF = 256
-    """发送缓冲区容量 (帧数)。满时自动丢弃最旧帧。可通过 set_buffer_size() 修改。"""
+    """发送缓冲区的历史最小容量 (帧数)，现在作为自动计算的兜底下限。"""
+
+    DEFAULT_SEND_RATE_HZ = 1000.0
+    """默认假设 ``send()`` 调用频率 (Hz)。"""
+
+    DEFAULT_TCP_RATE_HZ = 10.0
+    """默认 TCP 发送频率 (Hz)。"""
+
+    DEFAULT_BUFFER_SECONDS = 1.0
+    """默认希望缓冲多少秒的发送数据。"""
+
+    DEFAULT_MAX_BUFFER_BYTES = 1 << 20
+    """默认缓冲内存上限 (1 MiB)，通道很多时用于限制帧数。"""
 
     MAX_LINE_BYTES = 4096
     """单条命令的最大字节数，防止异常客户端让接收缓冲区无限增长。"""
@@ -122,25 +135,61 @@ class JustFloatServer:
     # 构造
     # ================================================================
 
-    def __init__(self, channels: int = 4, port: int = 12345):
+    def __init__(
+        self,
+        channels: int = 4,
+        port: int = 12345,
+        *,
+        send_rate_hz: float = DEFAULT_SEND_RATE_HZ,
+        tcp_rate_hz: float = DEFAULT_TCP_RATE_HZ,
+        buffer_seconds: float = DEFAULT_BUFFER_SECONDS,
+        max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES,
+    ):
         """创建服务端并启动发送线程。
 
         构造即启动: 绑定端口、开始监听、发送线程运行。
+
+        缓冲区按"1kHz 调用 send() + 10Hz TCP"自动估算：
+
+        - 每个 TCP 周期需要 ``ceil(send_rate_hz / tcp_rate_hz)`` 帧；
+        - 希望缓存 ``buffer_seconds`` 秒，但受 ``max_buffer_bytes`` 限制；
+        - 通道数越多，每帧字节数越大，同样内存下能缓存的帧数越少；
+        - 至少保留 ``MAX_BUF`` 帧和 2 个 TCP 周期，避免极端参数下立刻丢帧。
 
         Args:
             channels: 通道数量 (每帧浮点数个数), 默认 4
             port: TCP 监听端口, 默认 12345；传 0 由系统分配（可用
                 :attr:`port` 读取实际端口）
+            send_rate_hz: 假设主循环调用 ``send()`` 的频率，默认 1000Hz
+            tcp_rate_hz: TCP 发送线程频率，默认 10Hz
+            buffer_seconds: 期望缓冲的秒数，默认 1.0
+            max_buffer_bytes: 缓冲内存软上限，默认 1 MiB；通道数很大时
+                为保证至少 2 个 TCP 周期，实际内存可能略超
 
         Raises:
             OSError: 端口被占用或地址不可用
-            ValueError: channels < 1
+            ValueError: channels < 1 或频率/缓冲参数非正
         """
         if channels < 1:
             raise ValueError("channels 必须 >= 1")
 
+        send_rate_hz = float(send_rate_hz)
+        tcp_rate_hz = float(tcp_rate_hz)
+        buffer_seconds = float(buffer_seconds)
+        if send_rate_hz <= 0.0:
+            raise ValueError("send_rate_hz 必须为正数")
+        if tcp_rate_hz <= 0.0:
+            raise ValueError("tcp_rate_hz 必须为正数")
+        if buffer_seconds <= 0.0:
+            raise ValueError("buffer_seconds 必须为正数")
+        if max_buffer_bytes < 1:
+            raise ValueError("max_buffer_bytes 必须 >= 1")
+
         self._channels = channels
         self._running = True
+        self._send_rate_hz = send_rate_hz
+        self._tcp_rate_hz = tcp_rate_hz
+        self._send_interval = 1.0 / tcp_rate_hz
 
         # ---- 主线程写缓冲区 ----
         # array.array('f') = C 层面连续 float 数组, 紧凑且快速
@@ -152,9 +201,25 @@ class JustFloatServer:
         # 预计算 struct.pack 格式字符串 (恒定: <{channels}f)
         self._pack_fmt = f"<{channels}f"
 
-        # ---- 发送线程 FIFO 缓冲区 ----
+        # ---- 自动估算发送缓冲区 ----
+        # 每帧 = channels 个 float32 + JustFloat 帧尾
+        self._frame_bytes = 4 * channels + len(self.TAIL)
+        self._frames_per_cycle = max(
+            1, math.ceil(send_rate_hz / tcp_rate_hz)
+        )
+        desired_frames = max(1, math.ceil(send_rate_hz * buffer_seconds))
+        memory_cap_frames = max(1, max_buffer_bytes // self._frame_bytes)
+        self._buffer_frames = max(
+            self.MAX_BUF,
+            2 * self._frames_per_cycle,
+            min(desired_frames, memory_cap_frames),
+        )
+        self._buffer_bytes = self._buffer_frames * self._frame_bytes
+
         # 存储已打包的 bytes (struct.pack + TAIL), 发线程只做拼接
-        self._send_queue: collections.deque = collections.deque(maxlen=self.MAX_BUF)
+        self._send_queue: collections.deque = collections.deque(
+            maxlen=self._buffer_frames
+        )
 
         # ---- 客户端连接 ----
         self._client: Optional[socket.socket] = None
@@ -185,8 +250,10 @@ class JustFloatServer:
 
         print(
             f"JustFloatServer started: {channels} channels, "
-            f"buffer={self.MAX_BUF} frames, port={self._port}, "
-            f"send rate={1/self.SEND_INTERVAL:.0f}Hz"
+            f"buffer={self._buffer_frames} frames/"
+            f"{self._buffer_bytes / 1024:.1f} KiB, "
+            f"port={self._port}, send={send_rate_hz:g}Hz, "
+            f"tcp={tcp_rate_hz:g}Hz ({self._frames_per_cycle} frames/cycle)"
         )
 
     # ================================================================
@@ -241,10 +308,19 @@ class JustFloatServer:
     # 接收 API (VOFA+ 命令 → Python)
     # ================================================================
 
+    @overload
+    def get(self, cmd: Union[int, str], default: float) -> float: ...
+
+    @overload
+    def get(self, cmd: Union[int, str], default: Optional[float] = None) -> Optional[float]: ...
+
     def get(self, cmd: Union[int, str], default: Optional[float] = None) -> Optional[float]:
         """获取 ``cmdN`` 的最新值。
 
         参数既可以是整数 ``0``，也可以是字符串 ``"cmd0"``。
+
+        传入非 ``None`` 的 ``default`` 时，类型检查器会把返回值推断为
+        ``float``；不传或传 ``None`` 时返回 ``Optional[float]``。
 
         Args:
             cmd: 命令编号或名称，如 ``0`` / ``"cmd0"``
@@ -286,6 +362,31 @@ class JustFloatServer:
         """实际监听的 TCP 端口（构造时传 0 时尤其有用）。"""
         return self._port
 
+    @property
+    def send_interval(self) -> float:
+        """TCP 发送周期 (秒)，即 ``1 / tcp_rate_hz``。"""
+        return self._send_interval
+
+    @property
+    def frame_bytes(self) -> int:
+        """单个 JustFloat 帧的字节数：``4 * channels + 4``。"""
+        return self._frame_bytes
+
+    @property
+    def frames_per_cycle(self) -> int:
+        """每个 TCP 周期预计收到的帧数：``ceil(send_rate_hz / tcp_rate_hz)``。"""
+        return self._frames_per_cycle
+
+    @property
+    def buffer_frames(self) -> int:
+        """当前发送队列容量 (帧数)。"""
+        return self._buffer_frames
+
+    @property
+    def buffer_bytes(self) -> int:
+        """当前发送队列容量对应的字节数（按满队列估算）。"""
+        return self._buffer_bytes
+
     # ================================================================
     # 状态 / 生命周期
     # ================================================================
@@ -316,7 +417,13 @@ class JustFloatServer:
             raise ValueError("buffer size must be >= 1")
         # 用现有内容重建 deque, 按新 maxlen 截断
         self._send_queue = collections.deque(self._send_queue, maxlen=size)
-        print(f"Buffer size changed to {size} frames ({len(self._send_queue)} pending)")
+        self._buffer_frames = size
+        self._buffer_bytes = size * self._frame_bytes
+        print(
+            f"Buffer size changed to {size} frames "
+            f"({self._buffer_bytes / 1024:.1f} KiB, "
+            f"{len(self._send_queue)} pending)"
+        )
 
     def close(self) -> None:
         """停止服务端并释放资源。幂等。"""
@@ -335,11 +442,12 @@ class JustFloatServer:
                 pass
 
         # 等待线程退出。接收线程最多在 select 上等 0.1s，发送线程最多
-        # 睡 SEND_INTERVAL；0.3s 足够，避免 close() 长时间阻塞。
+        # 睡一个 TCP 周期；留 0.3s 余量，避免 close() 长时间阻塞。
         current = threading.current_thread()
+        join_timeout = max(0.3, 2.0 * self._send_interval)
         for thread in (self._thread, self._recv_thread):
             if thread is not None and thread is not current and thread.is_alive():
-                thread.join(timeout=0.3)
+                thread.join(timeout=join_timeout)
 
         print("JustFloatServer closed")
 
@@ -354,7 +462,7 @@ class JustFloatServer:
     # ================================================================
 
     def _sender_loop(self) -> None:
-        """发送线程主循环: 接受连接 + 每 0.1s 清空队列合并发送。
+        """发送线程主循环: 接受连接 + 每个 TCP 周期清空队列合并发送。
 
         每周期将所有待发帧拼接成一个大字节串，一次 sendall() 发出。
         相比逐帧发送: ① syscall 从 N 次降为 1 次 ② TCP 段利用率更高
@@ -363,7 +471,7 @@ class JustFloatServer:
         循环逻辑::
 
             while _running:
-                sleep(0.1)                ← 固定 10Hz 周期
+                sleep(interval)           ← 默认 10Hz 周期
                 if 无客户端 → accept()
                 while 队列有数据:
                     popleft → pack → 拼入 packet
@@ -371,7 +479,7 @@ class JustFloatServer:
                     sendall(packet)       ← 一次发出所有帧
         """
         while self._running:
-            time.sleep(self.SEND_INTERVAL)
+            time.sleep(self._send_interval)
 
             # ---- 阶段 1: 接受客户端 ----
             if self._client is None:

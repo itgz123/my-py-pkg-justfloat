@@ -11,8 +11,8 @@ VOFA+ 上位机看波形，同时接收 VOFA+ 控件（Slider、Button 等）发
 | 特性 | 说明 |
 | --- | --- |
 | 非阻塞 `set()` / `send()` | 主线程只写内存 + `struct.pack`，微秒级返回 |
-| 固定 10Hz 发送 | 发送线程每 0.1s 把队列里所有帧 `b"".join` 后一次 `sendall()` |
-| 有界 FIFO 缓冲 | `deque(maxlen=256)`，满了丢最旧帧保实时性，可 `set_buffer_size()` 调整 |
+| 默认 10Hz 发送 | 发送线程默认每 0.1s 把队列里所有帧 `b"".join` 后一次 `sendall()`，周期可配 |
+| 自动 FIFO 缓冲 | 按 `send_rate_hz`、`tcp_rate_hz`、`channels` 估算帧数/内存，满了丢最旧帧 |
 | 命令接收 | 独立接收线程解析 `cmd0:1.23456\n`，主线程用 `get()` / `get_data()` 取最新值 |
 | 单客户端 | 接受一个客户端，断开后自动等待重连 |
 | 连接查询 | `is_connected` 属性，可在发送前判断 VOFA+ 是否已连接 |
@@ -38,9 +38,35 @@ with JustFloatServer(channels=6, port=12345) as server:
         server.set(0, joint[0])
         server.set(1, joint[1])
         if server.is_connected:     # 未连接时可直接跳过，避免积压
-            server.send()           # 快照入队，发送线程每 0.1s 批量发出
+            server.send()           # 快照入队，发送线程默认每 0.1s 批量发出
         p.stepSimulation()
 ```
+
+### 缓冲区自动估算
+
+`JustFloatServer` 现在按“主循环 1kHz 调 `send()`、TCP 10Hz 发送”估算队列容量：
+
+```python
+server = JustFloatServer(
+    channels=8,          # 8 通道 -> 每帧 8*4+4 = 36 B
+    send_rate_hz=1000,   # 假设每秒 send() 1000 次
+    tcp_rate_hz=10,      # TCP 线程每秒发 10 次
+    buffer_seconds=1.0,  # 希望缓存 1 秒数据
+    max_buffer_bytes=1 << 20,  # 内存软上限 1 MiB
+)
+```
+
+计算方式：
+
+- `frames_per_cycle = ceil(send_rate_hz / tcp_rate_hz)`，默认 100 帧/周期；
+- `frame_bytes = 4 * channels + 4`；
+- 目标帧数 = `send_rate_hz * buffer_seconds`；
+- 再用 `max_buffer_bytes // frame_bytes` 限制内存；
+- 至少保留 `MAX_BUF=256` 帧和 2 个 TCP 周期，避免极端参数下立刻丢帧。
+
+8 通道默认得到 `1000` 帧（约 35 KiB）；1000 通道时受 1 MiB 限制得到 `261` 帧。
+实际值可通过 `server.buffer_frames` / `server.buffer_bytes` / `server.frames_per_cycle`
+读取，也可用 `server.set_buffer_size()` 手动覆盖。
 
 ### 获取 VOFA+ 发来的数据
 
@@ -93,7 +119,7 @@ VOFA+ 侧配置（与 `vofa+_config/vofa+.cmds.json` 对应）：
 
 | 方法 / 属性 | 说明 |
 | --- | --- |
-| `JustFloatServer(channels=4, port=12345)` | 创建并启动（构造即监听 + 启动发送线程）；`port=0` 时由系统分配 |
+| `JustFloatServer(channels=4, port=12345, *, send_rate_hz=1000, tcp_rate_hz=10, buffer_seconds=1.0, max_buffer_bytes=1<<20)` | 创建并启动；`port=0` 时由系统分配 |
 | `set(channel, value)` | 写 JustFloat 通道值，纳秒级，不阻塞 |
 | `send()` | 当前缓冲区打包入队，微秒级，不阻塞 |
 | `get(cmd, default=None)` | 取 `cmdN` 最新值；`cmd` 可为 `0` 或 `"cmd0"` |
@@ -101,15 +127,18 @@ VOFA+ 侧配置（与 `vofa+_config/vofa+.cmds.json` 对应）：
 | `has_data` | 属性：是否已收到过任意 `cmdN` |
 | `clear_data()` | 清空已接收的命令值 |
 | `is_connected` | 属性：当前是否有 VOFA+ 客户端连接 |
-| `port` | 属性：实际监听的 TCP 端口 |
-| `set_buffer_size(size)` | 运行时调整发送缓冲帧数（>=1） |
+| `port` / `send_interval` | 属性：实际监听端口 / TCP 发送周期 |
+| `frame_bytes` / `frames_per_cycle` | 属性：单帧字节数 / 每个 TCP 周期的预计帧数 |
+| `buffer_frames` / `buffer_bytes` | 属性：当前队列容量（帧 / 字节） |
+| `set_buffer_size(size)` | 运行时手动调整发送缓冲帧数（>=1） |
 | `close()` / `with` | 停止并释放资源（幂等） |
 
 ### TCP 未连接时
 
-- `send()` **不会阻塞、也不会报错**，仍会把帧打包压入有界队列；队列满（默认
-  256 帧）后丢最旧帧。发送线程在无客户端时只做 `accept()` 等待。
-- 客户端连上后，队列中积压的帧会在下一个 10Hz 发送周期一次性发出。
+- `send()` **不会阻塞、也不会报错**，仍会把帧打包压入有界队列；队列满（默认按
+  1kHz/10Hz/1s 自动估算，至少 256 帧）后丢最旧帧。发送线程在无客户端时只做
+  `accept()` 等待。
+- 客户端连上后，队列中积压的帧会在下一个 TCP 发送周期一次性发出。
   如果不希望重连瞬间收到旧数据，发送前先判断 `server.is_connected`。
 - 客户端断开后，接收线程会较快感知 EOF 并把 `is_connected` 置回 `False`。
 
