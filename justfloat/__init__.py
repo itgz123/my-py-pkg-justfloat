@@ -20,8 +20,17 @@
     import justfloat.justfloat as jf   # jf.JustFloatServer
 """
 
-from .justfloat import JustFloatServer
+from .justfloat import (
+    ChannelOverflowWarning,
+    FLOAT32_MAX,
+    JustFloatServer,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
-__all__ = ["JustFloatServer", "__version__"]
+__all__ = [
+    "JustFloatServer",
+    "ChannelOverflowWarning",
+    "FLOAT32_MAX",
+    "__version__",
+]

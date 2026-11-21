@@ -40,8 +40,17 @@ import struct
 import threading
 import array
 import collections
+import math
 import time
+import warnings
 from typing import Optional
+
+FLOAT32_MAX: float = 3.4028234663852886e38
+"""IEEE-754 单精度浮点数最大值（JustFloat 每通道 4 字节 float32）。"""
+
+
+class ChannelOverflowWarning(UserWarning):
+    """通道值超出 float32 范围或非有限，VOFA+ 端会显示 inf/nan。"""
 
 
 class JustFloatServer:
@@ -103,6 +112,9 @@ class JustFloatServer:
         # array.array('f') = C 层面连续 float 数组, 紧凑且快速
         self._buffer = array.array("f", [0.0]) * channels
 
+        # 已警告过溢出的通道（每通道只提醒一次，避免主循环刷屏）
+        self._overflowed_channels: set = set()
+
         # 预计算 struct.pack 格式字符串 (恒定: <{channels}f)
         self._pack_fmt = f"<{channels}f"
 
@@ -138,6 +150,11 @@ class JustFloatServer:
     def set(self, channel: int, value: float) -> None:
         """设置指定通道的值。仅写内存，纳秒级，永不阻塞。
 
+        若值超出 float32 范围或为 inf/nan，会发一次
+        :class:`ChannelOverflowWarning`（每通道只提醒一次）：缓冲区是
+        ``array('f')``，超范围的值会被静默存成 ``inf``，VOFA+ 端只看到
+        曲线骤停或断线。
+
         Args:
             channel: 通道索引 (0 ~ channels-1)
             value: 浮点值
@@ -145,6 +162,19 @@ class JustFloatServer:
         Raises:
             IndexError: channel 超出范围
         """
+        is_finite = math.isfinite(value)
+        overflow = not is_finite or abs(value) > FLOAT32_MAX
+        if overflow and channel not in self._overflowed_channels:
+            self._overflowed_channels.add(channel)
+            warnings.warn(
+                f"通道 {channel} 的值 {value:.6g} "
+                f"{'非有限' if not is_finite else '超出 float32 范围'}，"
+                f"写入缓冲区后会变成 inf/nan，VOFA+ 端无法显示。"
+                f"检查上游计算（常见原因：仿真步长过大导致数值发散）。"
+                f"（该通道只提醒一次）",
+                ChannelOverflowWarning,
+                stacklevel=2,
+            )
         self._buffer[channel] = value
 
     def send(self) -> None:

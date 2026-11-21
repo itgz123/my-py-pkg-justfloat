@@ -56,6 +56,25 @@ with JustFloatServer(channels=6, port=12345) as server:
 | `set_buffer_size(size)` | 运行时调整缓冲帧数（>=1） |
 | `close()` / `with` | 停止并释放资源（幂等） |
 
+## 溢出保护
+
+缓冲区是 `array('f')`（float32），超出 `3.4e38` 或 `inf/nan` 的值会被静默存成
+`inf`，VOFA+ 端只看到曲线骤停，很难定位。`set()` 会在写缓冲区前检查，每个
+通道**只提醒一次**：
+
+```python
+import warnings
+from justfloat import ChannelOverflowWarning, JustFloatServer
+
+with JustFloatServer(channels=2) as server:
+    with warnings.catch_warnings(record=True) as caught:
+        server.set(0, 1e39)      # ChannelOverflowWarning: 超出 float32 范围
+        server.set(1, float("nan"))  # ChannelOverflowWarning: 非有限
+```
+
+常见触发原因是上游仿真数值发散（例如步长超出积分器稳定域），警告里会提示
+先检查上游计算。`FLOAT32_MAX` 也一并导出，便于调用方自己预判。
+
 ## 帧格式
 
 ```
